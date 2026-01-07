@@ -84,7 +84,7 @@ All calculations are done in **Wh**, exactly like Shelly.
 
 ## Virtual Components
 
-The script automatically creates:
+The script **automatically** creates:
 
 ### Virtual Numbers
 
@@ -231,16 +231,16 @@ Alle Berechnungen erfolgen in **Wh**, exakt wie bei Shelly.
 
 ## Virtuelle Komponenten
 
-Das Skript erzeugt automatisch:
+Das Skript erzeugt **automatisch**:
 
 ### Virtuelle Zahlen
 
--   **Netto gemessene Energie** (Wh)
--   **Netto gemessene Einspeiseenergie** (Wh)
+-   **Net Metered Energy** (Wh) (Saldierte bezogene Energie)
+-   **Net Metered Energy Return** (Wh) (Saldierte eingespeiste Energie)
 
 ### Virtuelle Gruppe
 
--   **Energie‑Netto‑Saldierung**
+-   **Energy Net Metering**
 
 Beide Zahlen sind:
 
