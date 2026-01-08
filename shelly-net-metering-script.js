@@ -48,6 +48,10 @@ supported generation with AI
 // real elapsed time (dt) is measured.
 let INTEGRATION_TICK_MS = 500;
 
+// Totals / emdata Polling-Intervall in Millisekunden.
+// emdata-Totalwerte ändern sich nur langsam (~1x/min) – daher deutlich seltener pollen.
+let TOTALS_TICK_MS = 5000;
+
 // EM / EMData component IDs (Shelly Pro 3EM usually uses id = 0)
 let EM_ID = 0;
 let EMDATA_ID = 0;
@@ -62,6 +66,11 @@ let NET_METERED_ENERGY_RET_ID = 201;
 
 let NET_METERED_ENERGY_NAME = "Net Metered Energy";
 let NET_METERED_ENERGY_RET_NAME = "Net Metered Energy Return";
+
+// Precomputed keys für virtuelle Components / Group
+let NET_METERED_ENERGY_KEY = "number:" + NET_METERED_ENERGY_ID;
+let NET_METERED_ENERGY_RET_KEY = "number:" + NET_METERED_ENERGY_RET_ID;
+let NET_METERING_GROUP_KEY = "group:" + NET_METERING_GROUP_ID;
 
 // Enable or disable debug logging
 let LOG = false;
@@ -100,6 +109,10 @@ let last_correction_uptime_ms = 0;
 
 // Timing for power integration
 let last_integration_uptime_ms = null;
+
+// Aktuelle emdata-Totals (werden durch readTotalsWh() aktualisiert)
+let current_total_energy_wh = null;
+let current_total_energy_ret_wh = null;
 
 
 // =====================
@@ -143,9 +156,7 @@ function getComponentByKeyFromList(components, key) {
 }
 
 // Ensure a persisted virtual number component exists with correct name
-function ensureVirtualNumberComponent(id, expectedName, callback /* (ok:boolean) */) {
-    let key = "number:" + id;
-
+function ensureVirtualNumberComponent(id, key, expectedName, callback /* (ok:boolean) */) {
     Shelly.call(
         "Shelly.GetComponents",
         { dynamic_only: true, include: ["config"] },
@@ -202,9 +213,7 @@ function ensureVirtualNumberComponent(id, expectedName, callback /* (ok:boolean)
 }
 
 // Ensure a virtual group exists, has the correct name, and contains members
-function ensureVirtualGroupComponent(id, expectedName, memberKeys, callback /* (ok:boolean) */) {
-    let key = "group:" + id;
-
+function ensureVirtualGroupComponent(id, key, expectedName, memberKeys, callback /* (ok:boolean) */) {
     Shelly.call(
         "Shelly.GetComponents",
         { dynamic_only: true, include: ["config"] },
@@ -270,16 +279,16 @@ function readTotalPowerW() {
 }
 
 // Read Shelly internal energy counters (Wh)
+// Optimiert: keine Objekt-Erzeugung, schreibt direkt in globale Variablen
 function readTotalsWh() {
     let emdata_status = Shelly.getComponentStatus("emdata", EMDATA_ID);
-    if (!emdata_status) return null;
+    if (!emdata_status) return false;
 
-    if (!isNumber(emdata_status.total_act) || !isNumber(emdata_status.total_act_ret)) return null;
+    if (!isNumber(emdata_status.total_act) || !isNumber(emdata_status.total_act_ret)) return false;
 
-    return {
-        total_energy_wh: emdata_status.total_act,
-        total_energy_ret_wh: emdata_status.total_act_ret
-    };
+    current_total_energy_wh = emdata_status.total_act;
+    current_total_energy_ret_wh = emdata_status.total_act_ret;
+    return true;
 }
 
 
@@ -425,20 +434,30 @@ function applyCorrectionIfReady(total_energy_wh, total_energy_ret_wh) {
 
 
 // =====================
-// Main loop
+// Main loop (zweigeteilt)
 // =====================
 
-function tick() {
-    // Always integrate power
+// Schneller Tick: nur Leistungsintegration
+function integrationTick() {
     integratePower();
+}
 
-    // Totals logic + correction
-    let totals = readTotalsWh();
-    if (!totals) return;
+// Langsamer Tick: Totals lesen + Korrekturlogik
+function totalsTick() {
+    if (!readTotalsWh()) return;
 
-    startNewWindowBaselineIfNeeded(totals.total_energy_wh, totals.total_energy_ret_wh);
-    updateChangeDetection(totals.total_energy_wh, totals.total_energy_ret_wh);
-    applyCorrectionIfReady(totals.total_energy_wh, totals.total_energy_ret_wh);
+    startNewWindowBaselineIfNeeded(
+        current_total_energy_wh,
+        current_total_energy_ret_wh
+    );
+    updateChangeDetection(
+        current_total_energy_wh,
+        current_total_energy_ret_wh
+    );
+    applyCorrectionIfReady(
+        current_total_energy_wh,
+        current_total_energy_ret_wh
+    );
 }
 
 
@@ -447,8 +466,8 @@ function tick() {
 // =====================
 
 function loadPersistedNetMeteredValuesFromVirtualComponents() {
-    net_metered_energy_handle = Virtual.getHandle("number:" + NET_METERED_ENERGY_ID);
-    net_metered_energy_ret_handle = Virtual.getHandle("number:" + NET_METERED_ENERGY_RET_ID);
+    net_metered_energy_handle = Virtual.getHandle(NET_METERED_ENERGY_KEY);
+    net_metered_energy_ret_handle = Virtual.getHandle(NET_METERED_ENERGY_RET_KEY);
 
     let s1 = net_metered_energy_handle ? net_metered_energy_handle.getStatus() : null;
     let s2 = net_metered_energy_ret_handle ? net_metered_energy_ret_handle.getStatus() : null;
@@ -463,33 +482,49 @@ function loadPersistedNetMeteredValuesFromVirtualComponents() {
 }
 
 function start() {
-    ensureVirtualNumberComponent(NET_METERED_ENERGY_ID, NET_METERED_ENERGY_NAME, function () {
-        ensureVirtualNumberComponent(NET_METERED_ENERGY_RET_ID, NET_METERED_ENERGY_RET_NAME, function () {
-
-            ensureVirtualGroupComponent(
-                NET_METERING_GROUP_ID,
-                NET_METERING_GROUP_NAME,
-                [
-                    "number:" + NET_METERED_ENERGY_ID,
-                    "number:" + NET_METERED_ENERGY_RET_ID
-                ],
+    ensureVirtualNumberComponent(
+        NET_METERED_ENERGY_ID,
+        NET_METERED_ENERGY_KEY,
+        NET_METERED_ENERGY_NAME,
+        function () {
+            ensureVirtualNumberComponent(
+                NET_METERED_ENERGY_RET_ID,
+                NET_METERED_ENERGY_RET_KEY,
+                NET_METERED_ENERGY_RET_NAME,
                 function () {
-                    // read persisted values now that components exist
-                    loadPersistedNetMeteredValuesFromVirtualComponents();
 
-                    // initialize baseline immediately (optional, but helps avoid "first correction" oddities)
-                    let totals = readTotalsWh();
-                    if (totals) {
-                        startNewWindowBaselineIfNeeded(totals.total_energy_wh, totals.total_energy_ret_wh);
-                    }
+                    ensureVirtualGroupComponent(
+                        NET_METERING_GROUP_ID,
+                        NET_METERING_GROUP_KEY,
+                        NET_METERING_GROUP_NAME,
+                        [
+                            NET_METERED_ENERGY_KEY,
+                            NET_METERED_ENERGY_RET_KEY
+                        ],
+                        function () {
+                            // read persisted values now that components exist
+                            loadPersistedNetMeteredValuesFromVirtualComponents();
 
-                    Timer.set(INTEGRATION_TICK_MS, true, tick);
-                    log("Net metering script started");
+                            // initialize baseline immediately (optional, but helps avoid "first correction" oddities)
+                            if (readTotalsWh()) {
+                                startNewWindowBaselineIfNeeded(
+                                    current_total_energy_wh,
+                                    current_total_energy_ret_wh
+                                );
+                            }
+
+                            // Timer setzen: schneller Integrations-Tick + langsamer Totals-Tick
+                            Timer.set(INTEGRATION_TICK_MS, true, integrationTick);
+                            Timer.set(TOTALS_TICK_MS, true, totalsTick);
+
+                            log("Net metering script started");
+                        }
+                    );
+
                 }
             );
-
-        });
-    });
+        }
+    );
 }
 
 start();
