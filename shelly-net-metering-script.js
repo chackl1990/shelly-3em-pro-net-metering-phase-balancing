@@ -39,115 +39,119 @@ supported generation with AI
 ================================================================================
 */
 
+// =====================================================
+// Configuration / User Settings
+// =====================================================
 
-// =====================
-// User settings (Header)
-// =====================
-
-// Integration tick interval in milliseconds.
-// real elapsed time (dt) is measured.
+// Integration tick interval (ms). Defines resolution for power-to-energy integration.
 let INTEGRATION_TICK_MS = 500;
 
-// Totals / emdata Polling-Intervall in Millisekunden.
-// emdata-Totalwerte ändern sich nur langsam (~1x/min) – daher deutlich seltener pollen.
+// Polling interval for Shelly internal energy totals (ms).
+// Internal counters change slowly, so this can be relatively large.
 let TOTALS_TICK_MS = 5000;
 
-// EM / EMData component IDs (Shelly Pro 3EM usually uses id = 0)
-let EM_ID = 0;
-let EMDATA_ID = 0;
+// Component IDs for Shelly Pro 3EM
+let EM_ID = 0;        // "em" component (power / phase readings)
+let EMDATA_ID = 0;    // "emdata" component (internal energy counters)
 
-// Virtual group
+// Virtual group to show aggregated result components
 let NET_METERING_GROUP_ID = 200;
 let NET_METERING_GROUP_NAME = "Energy Net Metering";
 
-// Virtual number component IDs and names
-let NET_METERED_ENERGY_ID = 200;
-let NET_METERED_ENERGY_RET_ID = 201;
+// Virtual number component IDs for accumulated net import/export (Wh)
+let NET_METERED_ENERGY_ID = 200;      // net import energy
+let NET_METERED_ENERGY_RET_ID = 201;  // net export energy
 
 let NET_METERED_ENERGY_NAME = "Net Metered Energy";
 let NET_METERED_ENERGY_RET_NAME = "Net Metered Energy Return";
 
-// Precomputed keys für virtuelle Components / Group
+// Precomputed component keys for virtual numbers and group
 let NET_METERED_ENERGY_KEY = "number:" + NET_METERED_ENERGY_ID;
 let NET_METERED_ENERGY_RET_KEY = "number:" + NET_METERED_ENERGY_RET_ID;
 let NET_METERING_GROUP_KEY = "group:" + NET_METERING_GROUP_ID;
 
-// Enable or disable debug logging
+// Debug logging flag
 let LOG = false;
 
 
-// =====================
-// Internal state
-// =====================
+// =====================================================
+// Runtime State
+// =====================================================
 
-// Handles to virtual number components
+// Handles for virtual number components used to persist accumulated energy
 let net_metered_energy_handle = null;
 let net_metered_energy_ret_handle = null;
 
-// Persisted total values in Wh (loaded at startup)
-let net_metered_energy_wh = 0.0;
-let net_metered_energy_ret_wh = 0.0;
+// Accumulated net import/export energy (Wh), persisted via virtual numbers
+let net_metered_energy_wh = 0.0;       // accumulated net import energy
+let net_metered_energy_ret_wh = 0.0;   // accumulated net export energy
 
-// Integrated energy since last correction window (Wh)
-let delta_energy_integrate_wh = 0.0;       // Import (positive power)
-let delta_energy_ret_integrate_wh = 0.0;   // Export (negative power, absolute)
+// Integrated energy within the current correction window (Wh)
+let delta_energy_integrate_wh = 0.0;        // integrated import in current window
+let delta_energy_ret_integrate_wh = 0.0;    // integrated export in current window
 
+// Minimum energy difference used to decide if a correction is meaningful
 const ENERGY_EPSILON_WH = 0.001;
 
-// Baseline of Shelly internal energy counters at window start
-let baseline_total_energy_wh = null;       // EMData.total_act
-let baseline_total_energy_ret_wh = null;   // EMData.total_act_ret
+// Baseline values of Shelly’s internal energy counters at the start of a window
+let baseline_total_energy_wh = null;        // emdata.total_act at window start
+let baseline_total_energy_ret_wh = null;    // emdata.total_act_ret at window start
 
-// Last observed Shelly energy counters
+// Most recently observed Shelly totals, used for change detection
 let last_seen_total_energy_wh = null;
 let last_seen_total_energy_ret_wh = null;
 
-// Change / stability detection for Shelly totals
+// State for change/stability detection of Shelly totals
 let totals_changed_since_last_correction = false;
 let totals_last_change_uptime_ms = 0;
 let last_correction_uptime_ms = 0;
 
-// Timing for power integration
+// Timestamp of last power integration tick (uptime in ms)
 let last_integration_uptime_ms = null;
 
-// Aktuelle emdata-Totals (werden durch readTotalsWh() aktualisiert)
+// Current Shelly internal energy totals (Wh), updated by readTotalsWh()
 let current_total_energy_wh = null;
 let current_total_energy_ret_wh = null;
 
 
-// =====================
-// Helper functions
-// =====================
+// =====================================================
+// Helper Functions
+// =====================================================
 
-// Conditional logger
+/**
+ * Conditional logger that prints only if LOG is enabled.
+ */
 function log() {
     if (!LOG) return;
     print.apply(null, arguments);
 }
 
-// Numeric sanity check
+/**
+ * Returns true if x is a finite numeric value.
+ */
 function isNumber(x) {
     return typeof x === "number" && isFinite(x);
 }
 
-// Clamp value into a min/max range
+/**
+ * Clamps a numeric value to the inclusive range [minValue, maxValue].
+ */
 function clampMinMax(value, minValue, maxValue) {
     if (value < minValue) return minValue;
     if (value > maxValue) return maxValue;
     return value;
 }
 
-// Get device uptime in milliseconds
+/**
+ * Returns the device uptime in milliseconds.
+ */
 function getUptimeMs() {
     return Shelly.getUptimeMs();
 }
 
-
-// =====================
-// Virtual components management
-// =====================
-
-// Find a component by key in Shelly.GetComponents result
+/**
+ * Finds and returns a component by key from a Shelly.GetComponents result list.
+ */
 function getComponentByKeyFromList(components, key) {
     for (let i = 0; i < components.length; i++) {
         if (components[i].key === key) return components[i];
@@ -155,13 +159,21 @@ function getComponentByKeyFromList(components, key) {
     return null;
 }
 
-// Ensure a persisted virtual number component exists with correct name
-function ensureVirtualNumberComponent(id, key, expectedName, callback /* (ok:boolean) */) {
+
+// =====================================================
+// Virtual Component Management
+// =====================================================
+
+/**
+ * Ensures that a persisted virtual number component with a given id and key
+ * exists and has the expected name. Calls cb(true/false) on completion.
+ */
+function ensureVirtualNumberComponent(id, key, expectedName, cb) {
     Shelly.call(
         "Shelly.GetComponents",
         { dynamic_only: true, include: ["config"] },
-        function (result) {
-            let components = (result && result.components) ? result.components : [];
+        function (res) {
+            let components = res && res.components ? res.components : [];
             let existing = getComponentByKeyFromList(components, key);
 
             function createNew() {
@@ -184,11 +196,11 @@ function ensureVirtualNumberComponent(id, key, expectedName, callback /* (ok:boo
                     },
                     function (_res, err) {
                         if (err) {
-                            log("Virtual.Add failed for", key, "error:", JSON.stringify(err));
-                            callback(false);
+                            log("Virtual.Add failed for", key, JSON.stringify(err));
+                            cb(false);
                             return;
                         }
-                        callback(true);
+                        cb(true);
                     }
                 );
             }
@@ -198,41 +210,40 @@ function ensureVirtualNumberComponent(id, key, expectedName, callback /* (ok:boo
                 return;
             }
 
-            let existingName = existing.config ? existing.config.name : null;
-            if (existingName !== expectedName) {
-                log("Component", key, "exists but name differs:", existingName, "-> recreating");
+            let name = existing.config ? existing.config.name : null;
+            if (name !== expectedName) {
                 Shelly.call("Virtual.Delete", { key: key }, function () {
                     createNew();
                 });
                 return;
             }
 
-            callback(true);
+            cb(true);
         }
     );
 }
 
-// Ensure a virtual group exists, has the correct name, and contains members
-function ensureVirtualGroupComponent(id, key, expectedName, memberKeys, callback /* (ok:boolean) */) {
+/**
+ * Ensures that a virtual group component with a given id and key exists,
+ * has the expected name, and contains the specified member keys.
+ * Calls cb(true/false) on completion.
+ */
+function ensureVirtualGroupComponent(id, key, expectedName, members, cb) {
     Shelly.call(
         "Shelly.GetComponents",
         { dynamic_only: true, include: ["config"] },
-        function (result) {
-            let components = (result && result.components) ? result.components : [];
+        function (res) {
+            let components = res && res.components ? res.components : [];
             let existing = getComponentByKeyFromList(components, key);
 
-            function configureGroup() {
+            function configure() {
                 Shelly.call(
                     "Group.SetConfig",
                     { id: id, config: { name: expectedName } },
                     function () {
-                        Shelly.call(
-                            "Group.Set",
-                            { id: id, value: memberKeys },
-                            function () {
-                                callback(true);
-                            }
-                        );
+                        Shelly.call("Group.Set", { id: id, value: members }, function () {
+                            cb(true);
+                        });
                     }
                 );
             }
@@ -242,94 +253,102 @@ function ensureVirtualGroupComponent(id, key, expectedName, memberKeys, callback
                     "Virtual.Add",
                     { type: "group", id: id, config: { name: expectedName } },
                     function () {
-                        configureGroup();
+                        configure();
                     }
                 );
             }
 
+            let name = existing && existing.config ? existing.config.name : null;
             if (!existing) {
                 createNew();
                 return;
             }
 
-            let existingName = existing.config ? existing.config.name : null;
-            if (existingName !== expectedName) {
-                log("Group", key, "exists but name differs:", existingName, "-> recreating");
+            if (name !== expectedName) {
                 Shelly.call("Virtual.Delete", { key: key }, function () {
                     createNew();
                 });
                 return;
             }
 
-            configureGroup();
+            configure();
         }
     );
 }
 
 
-// =====================
-// Shelly readings
-// =====================
+// =====================================================
+// Shelly Readings
+// =====================================================
 
-// Read total active power (sum of all phases), in Watts
+/**
+ * Reads total active power (sum of all phases) in Watts from the EM component.
+ * Returns a numeric value or null if unavailable.
+ */
 function readTotalPowerW() {
-    let em_status = Shelly.getComponentStatus("em", EM_ID);
-    if (!em_status || !isNumber(em_status.total_act_power)) return null;
-    return em_status.total_act_power;
+    let em = Shelly.getComponentStatus("em", EM_ID);
+    if (!em || !isNumber(em.total_act_power)) return null;
+    return em.total_act_power;
 }
 
-// Read Shelly internal energy counters (Wh)
-// Optimiert: keine Objekt-Erzeugung, schreibt direkt in globale Variablen
+/**
+ * Reads Shelly internal energy counters (Wh) from the EMDATA component and
+ * stores them in current_total_energy_wh and current_total_energy_ret_wh.
+ * Returns true on success, false on failure.
+ */
 function readTotalsWh() {
-    let emdata_status = Shelly.getComponentStatus("emdata", EMDATA_ID);
-    if (!emdata_status) return false;
-
-    if (!isNumber(emdata_status.total_act) || !isNumber(emdata_status.total_act_ret)) return false;
-
-    current_total_energy_wh = emdata_status.total_act;
-    current_total_energy_ret_wh = emdata_status.total_act_ret;
+    let st = Shelly.getComponentStatus("emdata", EMDATA_ID);
+    if (!st) return false;
+    if (!isNumber(st.total_act) || !isNumber(st.total_act_ret)) return false;
+    current_total_energy_wh = st.total_act;
+    current_total_energy_ret_wh = st.total_act_ret;
     return true;
 }
 
 
-// =====================
-// Integration & correction logic
-// =====================
+// =====================================================
+// Integration & Correction Logic
+// =====================================================
 
-// Integrate power using real elapsed time
+/**
+ * Integrates total active power over elapsed time to produce energy in Wh.
+ * Uses device uptime to compute dt between integration ticks.
+ */
 function integratePower() {
-    let now_ms = getUptimeMs();
+    let now = getUptimeMs();
 
     if (last_integration_uptime_ms === null) {
-        last_integration_uptime_ms = now_ms;
+        last_integration_uptime_ms = now;
         return;
     }
 
-    let dt_ms = now_ms - last_integration_uptime_ms;
+    let dt_ms = now - last_integration_uptime_ms;
     if (dt_ms <= 0) return;
 
-    last_integration_uptime_ms = now_ms;
+    last_integration_uptime_ms = now;
 
-    let power_w = readTotalPowerW();
-    if (!isNumber(power_w)) return;
+    let p = readTotalPowerW();
+    if (!isNumber(p)) return;
 
-    let energy_wh = power_w * (dt_ms / 3600000.0);
-
-    if (energy_wh >= 0) {
-        delta_energy_integrate_wh += energy_wh;
+    let wh = p * (dt_ms / 3600000.0);
+    if (wh >= 0) {
+        delta_energy_integrate_wh += wh;
     } else {
-        delta_energy_ret_integrate_wh += -energy_wh;
+        delta_energy_ret_integrate_wh += -wh;
     }
 }
 
-// Initialize baseline at the start of a correction window
-function startNewWindowBaselineIfNeeded(total_energy_wh, total_energy_ret_wh) {
+/**
+ * Initializes baseline Shelly total energy counters at the beginning of a
+ * correction window, if not already set.
+ */
+function startBaselineIfNeeded(t, r) {
     if (!isNumber(baseline_total_energy_wh) || !isNumber(baseline_total_energy_ret_wh)) {
-        baseline_total_energy_wh = total_energy_wh;
-        baseline_total_energy_ret_wh = total_energy_ret_wh;
+        baseline_total_energy_wh = t;
+        baseline_total_energy_ret_wh = r;
 
-        last_seen_total_energy_wh = total_energy_wh;
-        last_seen_total_energy_ret_wh = total_energy_ret_wh;
+        last_seen_total_energy_wh = t;
+        last_seen_total_energy_ret_wh = r;
 
         totals_changed_since_last_correction = false;
         totals_last_change_uptime_ms = getUptimeMs();
@@ -337,135 +356,108 @@ function startNewWindowBaselineIfNeeded(total_energy_wh, total_energy_ret_wh) {
 
         delta_energy_integrate_wh = 0.0;
         delta_energy_ret_integrate_wh = 0.0;
-
-        log("Baseline initialized:",
-            "baseline_total_energy_wh =", baseline_total_energy_wh,
-            "baseline_total_energy_ret_wh =", baseline_total_energy_ret_wh
-        );
     }
 }
 
-// Detect changes in Shelly totals (they update ~once/minute)
-function updateChangeDetection(total_energy_wh, total_energy_ret_wh) {
+/**
+ * Tracks changes in Shelly internal totals to detect when a new stable value
+ * is available for correction.
+ */
+function updateTotalsChangeDetection(t, r) {
     if (!isNumber(last_seen_total_energy_wh) || !isNumber(last_seen_total_energy_ret_wh)) {
-        last_seen_total_energy_wh = total_energy_wh;
-        last_seen_total_energy_ret_wh = total_energy_ret_wh;
+        last_seen_total_energy_wh = t;
+        last_seen_total_energy_ret_wh = r;
         return;
     }
 
-    if (total_energy_wh !== last_seen_total_energy_wh || total_energy_ret_wh !== last_seen_total_energy_ret_wh) {
+    if (t !== last_seen_total_energy_wh || r !== last_seen_total_energy_ret_wh) {
         totals_changed_since_last_correction = true;
         totals_last_change_uptime_ms = getUptimeMs();
-
-        last_seen_total_energy_wh = total_energy_wh;
-        last_seen_total_energy_ret_wh = total_energy_ret_wh;
+        last_seen_total_energy_wh = t;
+        last_seen_total_energy_ret_wh = r;
     }
 }
 
-// Apply correction once totals are stable for 5 seconds
-function applyCorrectionIfReady(total_energy_wh, total_energy_ret_wh) {
+/**
+ * Applies a correction to the integrated import/export energy based on the
+ * difference between Shelly internal totals and the baseline, once the totals
+ * have been stable for a minimum time.
+ */
+function applyCorrectionIfReady(t, r) {
     if (!totals_changed_since_last_correction) return;
 
-    let now_ms = getUptimeMs();
+    let now = getUptimeMs();
+    if ((now - totals_last_change_uptime_ms) < 5000) return;
 
-    // wait until totals are stable for 5 seconds
-    if ((now_ms - totals_last_change_uptime_ms) < 5000) return;
+    let dt_total = t - baseline_total_energy_wh;
+    let dt_ret_total = r - baseline_total_energy_ret_wh;
 
-    let delta_total_energy_wh = total_energy_wh - baseline_total_energy_wh;
-    let delta_total_energy_ret_wh = total_energy_ret_wh - baseline_total_energy_ret_wh;
+    let sum_total = dt_total - dt_ret_total;
+    let sum_integrated = delta_energy_integrate_wh - delta_energy_ret_integrate_wh;
 
-    // Renamed: show delta_energy_sum (window delta), not total_energy_sum
-    let delta_energy_sum = delta_total_energy_wh - delta_total_energy_ret_wh;
-
-    // This is already the window delta (integration resets to 0 each window)
-    let delta_energy_integrate_sum =
-        delta_energy_integrate_wh - delta_energy_ret_integrate_wh;
-
-    let correction_factor = 1.0;
-    if (isNumber(delta_energy_integrate_sum) && Math.abs(delta_energy_integrate_sum) > ENERGY_EPSILON_WH) {
-        correction_factor = delta_energy_sum / delta_energy_integrate_sum;
-
-        if (!isNumber(correction_factor)) correction_factor = 1.0;
-        if (correction_factor <= 0.001) correction_factor = 1.0;
-    } else {
-        // no meaningful integration -> do not distort
-        correction_factor = 1.0;
+    let k = 1.0;
+    if (isNumber(sum_integrated) && Math.abs(sum_integrated) > ENERGY_EPSILON_WH) {
+        k = sum_total / sum_integrated;
+        if (!isNumber(k)) k = 1.0;
+        if (k <= 0.001) k = 1.0;
     }
 
-    // If you do NOT want any clamping, comment out this line.
-    // Conservative sanity clamp against single-tick spikes / counter resets.
-    correction_factor = clampMinMax(correction_factor, 0.1, 10.0);
+    k = clampMinMax(k, 0.1, 10.0);
 
-    let delta_energy_integrate_corrected =
-        delta_energy_integrate_wh * correction_factor;
+    let dt_int = delta_energy_integrate_wh * k;
+    let dt_ret_int = delta_energy_ret_integrate_wh * k;
 
-    let delta_energy_ret_integrate_corrected =
-        delta_energy_ret_integrate_wh * correction_factor;
+    net_metered_energy_wh += dt_int;
+    net_metered_energy_ret_wh += dt_ret_int;
 
-    net_metered_energy_wh += delta_energy_integrate_corrected;
-    net_metered_energy_ret_wh += delta_energy_ret_integrate_corrected;
-
-    // Persist to virtual numbers (Wh)
     if (net_metered_energy_handle) net_metered_energy_handle.setValue(net_metered_energy_wh);
     if (net_metered_energy_ret_handle) net_metered_energy_ret_handle.setValue(net_metered_energy_ret_wh);
 
-    // Updated logging: show only window deltas + correction factor + corrected deltas
-    log("Correction applied:",
-        "correction_factor =", correction_factor,
-        "delta_energy_sum =", delta_energy_sum,
-        "delta_energy_integrate_sum =", delta_energy_integrate_sum,
-        "delta_energy_integrate_corrected =", delta_energy_integrate_corrected,
-        "delta_energy_ret_integrate_corrected =", delta_energy_ret_integrate_corrected
-    );
-
-    // Start next window
-    baseline_total_energy_wh = total_energy_wh;
-    baseline_total_energy_ret_wh = total_energy_ret_wh;
+    baseline_total_energy_wh = t;
+    baseline_total_energy_ret_wh = r;
 
     delta_energy_integrate_wh = 0.0;
     delta_energy_ret_integrate_wh = 0.0;
 
     totals_changed_since_last_correction = false;
-    last_correction_uptime_ms = now_ms;
+    last_correction_uptime_ms = now;
 
-    // reset integration time anchor to avoid a large dt after "window close"
-    last_integration_uptime_ms = now_ms;
+    last_integration_uptime_ms = now;
 }
 
 
-// =====================
-// Main loop (zweigeteilt)
-// =====================
+// =====================================================
+// Timer Tick Functions
+// =====================================================
 
-// Schneller Tick: nur Leistungsintegration
+/**
+ * Timer callback for fast integration ticks. Performs only power integration.
+ */
 function integrationTick() {
     integratePower();
 }
 
-// Langsamer Tick: Totals lesen + Korrekturlogik
+/**
+ * Timer callback for slower totals ticks. Reads Shelly totals and triggers
+ * baseline initialization, change detection, and correction.
+ */
 function totalsTick() {
     if (!readTotalsWh()) return;
-
-    startNewWindowBaselineIfNeeded(
-        current_total_energy_wh,
-        current_total_energy_ret_wh
-    );
-    updateChangeDetection(
-        current_total_energy_wh,
-        current_total_energy_ret_wh
-    );
-    applyCorrectionIfReady(
-        current_total_energy_wh,
-        current_total_energy_ret_wh
-    );
+    startBaselineIfNeeded(current_total_energy_wh, current_total_energy_ret_wh);
+    updateTotalsChangeDetection(current_total_energy_wh, current_total_energy_ret_wh);
+    applyCorrectionIfReady(current_total_energy_wh, current_total_energy_ret_wh);
 }
 
 
-// =====================
-// Startup sequence
-// =====================
+// =====================================================
+// Startup & Initialization
+// =====================================================
 
-function loadPersistedNetMeteredValuesFromVirtualComponents() {
+/**
+ * Loads persisted accumulated net import/export energy from virtual numbers
+ * into local state variables.
+ */
+function loadPersisted() {
     net_metered_energy_handle = Virtual.getHandle(NET_METERED_ENERGY_KEY);
     net_metered_energy_ret_handle = Virtual.getHandle(NET_METERED_ENERGY_RET_KEY);
 
@@ -474,13 +466,12 @@ function loadPersistedNetMeteredValuesFromVirtualComponents() {
 
     net_metered_energy_wh = (s1 && isNumber(s1.value)) ? s1.value : 0.0;
     net_metered_energy_ret_wh = (s2 && isNumber(s2.value)) ? s2.value : 0.0;
-
-    log("Startup values loaded:",
-        "net_metered_energy_wh =", net_metered_energy_wh,
-        "net_metered_energy_ret_wh =", net_metered_energy_ret_wh
-    );
 }
 
+/**
+ * Entry point: ensures virtual components exist, loads persisted state,
+ * initializes baseline totals (if available), and starts the timers.
+ */
 function start() {
     ensureVirtualNumberComponent(
         NET_METERED_ENERGY_ID,
@@ -492,7 +483,6 @@ function start() {
                 NET_METERED_ENERGY_RET_KEY,
                 NET_METERED_ENERGY_RET_NAME,
                 function () {
-
                     ensureVirtualGroupComponent(
                         NET_METERING_GROUP_ID,
                         NET_METERING_GROUP_KEY,
@@ -502,25 +492,19 @@ function start() {
                             NET_METERED_ENERGY_RET_KEY
                         ],
                         function () {
-                            // read persisted values now that components exist
-                            loadPersistedNetMeteredValuesFromVirtualComponents();
+                            loadPersisted();
 
-                            // initialize baseline immediately (optional, but helps avoid "first correction" oddities)
                             if (readTotalsWh()) {
-                                startNewWindowBaselineIfNeeded(
+                                startBaselineIfNeeded(
                                     current_total_energy_wh,
                                     current_total_energy_ret_wh
                                 );
                             }
 
-                            // Timer setzen: schneller Integrations-Tick + langsamer Totals-Tick
                             Timer.set(INTEGRATION_TICK_MS, true, integrationTick);
                             Timer.set(TOTALS_TICK_MS, true, totalsTick);
-
-                            log("Net metering script started");
                         }
                     );
-
                 }
             );
         }
